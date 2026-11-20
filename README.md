@@ -4,7 +4,7 @@ ShazamX restores song recognition in Shazam 5.5.1 on iOS 6. It shows the track t
 
 ## Install
 
-Install Shazam 5.5.1 (build 572), then install ShazamX from the [Cydia source](https://mrnik12.github.io/repo/) or download the `.deb` from [GitHub Releases](https://github.com/mrnik12/ShazamX/releases). Open Shazam and tap the blue dial. You can turn the tweak on or off under **Settings → ShazamX**.
+Install Shazam 5.5.1, then install ShazamX from the [Cydia source](https://mrnik12.github.io/repo/) or download the `.deb` from [GitHub Releases](https://github.com/mrnik12/ShazamX/releases/latest). Open Shazam and tap the blue dial. You can turn the tweak on or off under **Settings → ShazamX**.
 
 Tested on iPhone 4S running iOS 6.1.3. Other iOS 6 devices may work. The tweak needs internet access. The free recognition server can take about a minute to wake after being idle.
 
