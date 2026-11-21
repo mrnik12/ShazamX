@@ -1,14 +1,14 @@
 Package: org.legacyshazam.smoke
 Name: ShazamX
-Version: 0.3.7
+Version: 0.3.8
 Architecture: iphoneos-arm
-Description: Restores song recognition in Shazam 5.5.1 on iOS 6.
+Description: Song recognition for Shazam 5.5.1 on iOS 6 and Shazam 7.2.0 on iOS 7.
  .
- Install Shazam 5.5.1 before installing this tweak.
+ Netrun is the default recognition server. Render remains available in Settings.
  .
- Turn the tweak on or off in Settings > ShazamX.
+ Known limitation: opening a saved tag can remain on the loading screen on Shazam 7.2.0.
  .
- Tested on iPhone 4S running iOS 6.1.3. Other iOS 6 devices may work.
+ Enable or disable ShazamX in Settings > ShazamX.
 Maintainer: mrnik12
 Author: mrnik12
 Section: Tweaks
