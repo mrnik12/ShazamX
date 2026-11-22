@@ -25,5 +25,5 @@ make stage FINALPACKAGE=1
 install -D -m 0644 control .theos/_/DEBIAN/control
 version=$(sed -n 's/^Version: //p' control | tr -d '\r')
 package="$project/org.legacyshazam.smoke_${version}_hosted_iphoneos-arm.deb"
-dpkg-deb --root-owner-group -Zgzip --build .theos/_ "$package"
+dpkg-deb --root-owner-group -Zgzip -z9 --build .theos/_ "$package"
 

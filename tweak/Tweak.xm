@@ -3,11 +3,13 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <QuartzCore/QuartzCore.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <ImageIO/ImageIO.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
 @interface SHCoreDataHelper : NSObject
 - (NSManagedObjectContext *)managedObjectContext;
+- (BOOL)save:(NSError **)error;
 @end
 
 @interface SHTaggingDataManager : NSObject
@@ -15,6 +17,7 @@
 - (NSArray *)unsubmittedTags;
 - (void)deleteTag:(NSManagedObject *)tag;
 - (void)cacheTagCountData;
+- (NSManagedObject *)saveTagWithTrackId:(id)trackId eventId:(id)eventId tagId:(NSString *)tagId;
 @end
 
 static SHTaggingDataManager *LSTagManager(void) {
@@ -36,6 +39,21 @@ static void LSRefreshTagCount(void) {
     }
 }
 
+static void LSCopyMatchFields(NSManagedObject *preview, NSManagedObject *saved) {
+    NSArray *fields = @[@"name", @"subtitle", @"cachedArtistString", @"type", @"date", @"completeResult",
+                        @"albumArtData", @"albumArtThumbnailData"];
+    NSDictionary *previewAttributes = preview.entity.attributesByName;
+    NSDictionary *savedAttributes = saved.entity.attributesByName;
+    for (NSString *key in fields) {
+        if (previewAttributes[key] && savedAttributes[key]) {
+            id value = [preview valueForKey:key];
+            if (value) {
+                [saved setValue:value forKey:key];
+            }
+        }
+    }
+}
+
 static NSManagedObject *LSSaveMatch(NSManagedObject *preview) {
     NSManagedObjectContext *context = LSHistoryContext();
     if (!context) { return nil; }
@@ -48,11 +66,7 @@ static NSManagedObject *LSSaveMatch(NSManagedObject *preview) {
 
     NSManagedObject *tag = [[[NSClassFromString(tagEntity.managedObjectClassName) alloc] initWithEntity:tagEntity insertIntoManagedObjectContext:nil] autorelease];
     NSManagedObject *saved = [[[NSClassFromString(resultEntity.managedObjectClassName) alloc] initWithEntity:resultEntity insertIntoManagedObjectContext:nil] autorelease];
-    NSArray *fields = @[@"name", @"subtitle", @"cachedArtistString", @"type", @"date", @"completeResult",
-                        @"albumArtData", @"albumArtThumbnailData"];
-    for (NSString *key in fields) {
-        [saved setValue:[preview valueForKey:key] forKey:key];
-    }
+    LSCopyMatchFields(preview, saved);
     [saved setValue:@YES forKey:@"isInUserTagList"];
     [saved setValue:@YES forKey:@"viewed"];
     [tag setValue:[preview valueForKey:@"date"] forKey:@"date"];
@@ -106,21 +120,29 @@ typedef void (^LSRelayCompletion)(NSURLResponse *, NSData *, NSError *);
     NSDate *_deadline;
     BOOL _submitted;
 }
-+ (void)send:(NSURLRequest *)request completion:(LSRelayCompletion)completion;
+- (id)initWithRequest:(NSURLRequest *)request completion:(LSRelayCompletion)completion;
+- (void)start;
+- (void)cancel;
 @end
 
 @implementation LSRelayWebRequest
-+ (void)send:(NSURLRequest *)request completion:(LSRelayCompletion)completion {
-    LSRelayWebRequest *transfer = [[self alloc] init];
-    transfer->_request = [request copy];
-    transfer->_completion = [completion copy];
-    transfer->_deadline = [[NSDate dateWithTimeIntervalSinceNow:request.timeoutInterval] retain];
-    transfer->_web = [[UIWebView alloc] initWithFrame:CGRectMake(0, 0, 1, 1)];
-    transfer->_web.delegate = transfer;
-    transfer->_healthURL = [[[NSURL URLWithString:@"/health" relativeToURL:request.URL] absoluteURL] retain];
-    [transfer->_web loadRequest:[NSURLRequest requestWithURL:transfer->_healthURL
-        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:request.timeoutInterval]];
-    [transfer poll];
+- (id)initWithRequest:(NSURLRequest *)request completion:(LSRelayCompletion)completion {
+    self = [super init];
+    if (self) {
+        _request = [request copy];
+        _completion = [completion copy];
+        _deadline = [[NSDate dateWithTimeIntervalSinceNow:request.timeoutInterval] retain];
+        _web = [[UIWebView alloc] initWithFrame:CGRectMake(0, 0, 1, 1)];
+        _web.delegate = self;
+        _healthURL = [[[NSURL URLWithString:@"/health" relativeToURL:request.URL] absoluteURL] retain];
+    }
+    return self;
+}
+
+- (void)start {
+    [_web loadRequest:[NSURLRequest requestWithURL:_healthURL
+        cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:_request.timeoutInterval]];
+    [self poll];
 }
 
 - (void)dealloc {
@@ -133,18 +155,31 @@ typedef void (^LSRelayCompletion)(NSURLResponse *, NSData *, NSError *);
     [super dealloc];
 }
 
+- (void)cancel {
+    LSRelayCompletion completion = _completion;
+    _completion = nil;
+    _web.delegate = nil;
+    if (_submitted && [_request.HTTPMethod isEqualToString:@"POST"]) {
+        [_web stringByEvaluatingJavaScriptFromString:
+            @"var x=window.__shazamxUpload;if(x&&x.readyState<4)x.abort();window.__shazamxUpload=null;"];
+    }
+    [_web stopLoading];
+    [completion release];
+}
+
 - (void)finishStatus:(NSInteger)status data:(NSData *)data error:(NSError *)error {
     if (!_completion) {
         return;
     }
-    LSRelayCompletion completion = [_completion autorelease];
+    LSRelayCompletion completion = _completion;
     _completion = nil;
-    _web.delegate = nil;
-    [_web stopLoading];
+    [self cancel];
     NSHTTPURLResponse *response = status ? [[[NSHTTPURLResponse alloc] initWithURL:_request.URL
         statusCode:status HTTPVersion:@"HTTP/1.1" headerFields:nil] autorelease] : nil;
+    [self retain];
     completion(response, data, error);
-    [self autorelease];
+    [completion release];
+    [self release];
 }
 
 - (void)failWithCode:(NSInteger)code description:(NSString *)description {
@@ -182,7 +217,7 @@ typedef void (^LSRelayCompletion)(NSURLResponse *, NSData *, NSError *);
     NSString *base64 = [_request.HTTPBody base64EncodedStringWithOptions:0];
     NSString *script = [NSString stringWithFormat:
         @"(function(){window.__shazamxResult=null;try{"
-         "var x=new XMLHttpRequest(),b=atob('%@'),a=new Uint8Array(b.length);"
+         "var x=window.__shazamxUpload=new XMLHttpRequest(),b=atob('%@'),a=new Uint8Array(b.length);"
          "for(var i=0;i<b.length;i++)a[i]=b.charCodeAt(i);"
          "x.open('POST','/recognize',true);x.timeout=45000;"
          "x.setRequestHeader('Content-Type','audio/wav');"
@@ -226,23 +261,20 @@ typedef void (^LSRelayCompletion)(NSURLResponse *, NSData *, NSError *);
 }
 @end
 
-static void LSSendRecognitionRequest(NSURLRequest *request, LSRelayCompletion completion) {
+static BOOL LSRelayUsesWebKit(NSURLRequest *request) {
     NSURL *url = request.URL;
-    if (LSShazam720 && [url.scheme isEqualToString:@"https"] &&
+    return LSShazam720 && [url.scheme isEqualToString:@"https"] &&
         ([url.host isEqualToString:@"legacy-shazam-relay.onrender.com"] ||
          [url.host isEqualToString:[[NSURL URLWithString:LS_RELAY_URL] host]]) &&
         ([url.path isEqualToString:@"/health"] || [url.path isEqualToString:@"/recognize"]) &&
-        ![request valueForHTTPHeaderField:@"X-Relay-Token"]) {
-        [LSRelayWebRequest send:request completion:completion];
-        return;
-    }
-    [NSURLConnection sendAsynchronousRequest:request queue:[NSOperationQueue mainQueue] completionHandler:completion];
+        ![request valueForHTTPHeaderField:@"X-Relay-Token"];
 }
 
 static char FixtureMarker;
 static NSDictionary *LSPreferences(void);
 
 @interface SHTagResultDefaultTrackView_iPhone : UIView
+- (NSManagedObject *)tagResult;
 - (UIImageView *)albumArtImageView;
 @end
 
@@ -285,6 +317,17 @@ static NSString *LS720CoverPath(NSString *title, NSString *artist, BOOL createDi
     return [directory stringByAppendingPathComponent:filename];
 }
 
+static NSCache *LS720CoverCache(void) {
+    static NSCache *cache;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cache = [[NSCache alloc] init];
+        cache.countLimit = 24;
+        cache.totalCostLimit = 4 * 1024 * 1024;
+    });
+    return cache;
+}
+
 static unsigned char LSHexDigit(unsigned char digit) {
     if (digit >= '0' && digit <= '9') {
         return digit - '0';
@@ -320,6 +363,22 @@ static NSData *LSDecodeArtwork(id value) {
 
 @interface SHTagResultViewController_iPhone : UIViewController
 - (UITableView *)tableView;
+- (NSManagedObject *)tagResult;
+- (NSArray *)filteredAddOns;
+@end
+
+@interface SHAddOn : NSObject
+- (NSString *)providerName;
+@end
+
+@interface SHDefaultUserInterfaceManager_iPhone : NSObject
+- (id)tabBarController;
+- (UIViewController *)tagListViewController;
+- (SHTaggingDataManager *)taggingDataManager;
+@end
+
+@interface NSObject (LSShazamAppDelegate)
+- (SHDefaultUserInterfaceManager_iPhone *)userInterfaceManager;
 @end
 
 @interface SHTagListTableViewCell_iPhone : UITableViewCell
@@ -328,24 +387,8 @@ static NSData *LSDecodeArtwork(id value) {
 - (UILabel *)trackTitleLabel;
 @end
 
-static char LS720ThumbnailKey;
-
-%group TagArtwork720
-%hook SHTagListTableViewCell_iPhone
-- (void)configureWithTag:(id)tag isEditing:(BOOL)editing showFavouriteButton:(BOOL)showFavourite
-              indexPath:(NSIndexPath *)indexPath {
-    %orig;
-    UIImageView *thumbnail = objc_getAssociatedObject(self, &LS720ThumbnailKey);
-    thumbnail.image = nil;
-    thumbnail.hidden = YES;
-    if (editing) {
-        return;
-    }
-
-    id result = [self tagResult];
-    NSString *title = [self trackTitleLabel].text;
-    UILabel *artistLabel = [self trackArtistLabel];
-    NSString *artist = artistLabel.text;
+static UIImage *LS720CachedCover(id result, NSString *title, NSString **resolvedArtist) {
+    NSString *artist = *resolvedArtist;
     if ([result isKindOfClass:[NSManagedObject class]]) {
         NSManagedObject *record = result;
         NSDictionary *attributes = record.entity.attributesByName;
@@ -360,14 +403,87 @@ static char LS720ThumbnailKey;
         }
     }
     if (!artist.length) {
-        NSString *indexPath = LS720CoverPath(title, @"title-index", NO);
-        NSDictionary *entry = indexPath ? [NSDictionary dictionaryWithContentsOfFile:
-            [indexPath stringByAppendingPathExtension:@"plist"]] : nil;
+        NSString *indexBase = LS720CoverPath(title, @"title-index", NO);
+        NSDictionary *entry = indexBase ? [NSDictionary dictionaryWithContentsOfFile:
+            [indexBase stringByAppendingPathExtension:@"plist"]] : nil;
         artist = entry[@"artist"];
     }
 
     NSString *path = LS720CoverPath(title, artist, NO);
-    UIImage *cover = path ? [UIImage imageWithContentsOfFile:path] : nil;
+    *resolvedArtist = artist;
+    if (!path) {
+        return nil;
+    }
+
+    NSCache *cache = LS720CoverCache();
+    UIImage *cover = [cache objectForKey:path];
+    if (!cover) {
+        cover = [UIImage imageWithContentsOfFile:path];
+        CGImageRef pixels = cover.CGImage;
+        if (pixels) {
+            uint64_t cost = (uint64_t)CGImageGetWidth(pixels) * CGImageGetHeight(pixels) * 4;
+            if (cost <= cache.totalCostLimit) {
+                [cache setObject:cover forKey:path cost:(NSUInteger)cost];
+            }
+        }
+    }
+    return cover;
+}
+
+@interface SHTagResultCardTrackView_iPhone : SHTagResultDefaultTrackView_iPhone
+@end
+
+@interface SHAddOnTableViewCell : UITableViewCell
+// Available on iOS 7 and later. The tweak also builds against the iOS 6.1 SDK.
+- (UIEdgeInsets)separatorInset;
+- (void)setSeparatorInset:(UIEdgeInsets)insets;
+@end
+
+static char LS720ThumbnailKey;
+static char LS720DetailCoverKey;
+static char LS720DeleteIconVisibilityKey;
+static char LS720DeleteSeparatorInsetKey;
+
+static void LS720ApplyDetailCover(SHTagResultDefaultTrackView_iPhone *header) {
+    UIImage *cover = objc_getAssociatedObject(header, &LS720DetailCoverKey);
+    if (!cover) {
+        return;
+    }
+    UIImageView *artwork = [header albumArtImageView];
+    if (artwork.image != cover) {
+        artwork.image = cover;
+    }
+}
+
+static void LS720ConfigureDetailCover(SHTagResultDefaultTrackView_iPhone *header) {
+    NSManagedObject *result = [header tagResult];
+    UIImage *cover = nil;
+    if ([result isKindOfClass:[NSManagedObject class]] && result.managedObjectContext && !result.isDeleted) {
+        NSString *artist = nil;
+        cover = LS720CachedCover(result, nil, &artist);
+    }
+    objc_setAssociatedObject(header, &LS720DetailCoverKey, cover, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (cover) {
+        LS720ApplyDetailCover(header);
+        [header setNeedsLayout];
+    }
+}
+
+%group TagArtwork720
+%hook SHTagListTableViewCell_iPhone
+- (void)configureWithTag:(id)tag isEditing:(BOOL)editing showFavouriteButton:(BOOL)showFavourite
+              indexPath:(NSIndexPath *)indexPath {
+    %orig;
+    UIImageView *thumbnail = objc_getAssociatedObject(self, &LS720ThumbnailKey);
+    thumbnail.image = nil;
+    thumbnail.hidden = YES;
+    if (editing) {
+        return;
+    }
+
+    UILabel *artistLabel = [self trackArtistLabel];
+    NSString *artist = artistLabel.text;
+    UIImage *cover = LS720CachedCover([self tagResult], [self trackTitleLabel].text, &artist);
     if (!cover) {
         return;
     }
@@ -412,6 +528,75 @@ static char LS720ThumbnailKey;
     thumbnail.hidden = YES;
 }
 %end
+
+%hook SHTagResultDefaultTrackView_iPhone
+- (void)configureWithTag:(id)tag {
+    %orig;
+    LS720ConfigureDetailCover(self);
+}
+
+- (void)layoutSubviews {
+    LS720ApplyDetailCover(self);
+    %orig;
+}
+%end
+
+// The card header implements its own configureWithTag: and creates its own image view.
+%hook SHTagResultCardTrackView_iPhone
+- (void)configureWithTag:(id)tag {
+    %orig;
+    LS720ConfigureDetailCover(self);
+}
+%end
+
+%hook SHAddOnTableViewCell
+- (void)configureWithAddOn:(SHAddOn *)action {
+    NSNumber *previousVisibility = objc_getAssociatedObject(self, &LS720DeleteIconVisibilityKey);
+    if (previousVisibility) {
+        self.imageView.hidden = previousVisibility.boolValue;
+    }
+    NSValue *previousInset = objc_getAssociatedObject(self, &LS720DeleteSeparatorInsetKey);
+    if (previousInset) {
+        [self setSeparatorInset:previousInset.UIEdgeInsetsValue];
+        objc_setAssociatedObject(self, &LS720DeleteSeparatorInsetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    %orig;
+    if ([[action providerName] isEqualToString:@"tag_delete"]) {
+        previousVisibility = @(self.imageView.hidden);
+        self.imageView.hidden = YES;
+    } else {
+        previousVisibility = nil;
+    }
+    objc_setAssociatedObject(self, &LS720DeleteIconVisibilityKey, previousVisibility, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [self setNeedsLayout];
+}
+
+- (void)layoutSubviews {
+    %orig;
+    if (!objc_getAssociatedObject(self, &LS720DeleteIconVisibilityKey)) {
+        return;
+    }
+
+    UILabel *label = self.textLabel;
+    CGRect frame = label.frame;
+    CGFloat leadingInset = 15.0;
+    if (CGRectGetMinX(frame) > leadingInset) {
+        frame.size.width = CGRectGetMaxX(frame) - leadingInset;
+        frame.origin.x = leadingInset;
+        label.frame = frame;
+    }
+    if ([self respondsToSelector:@selector(setSeparatorInset:)]) {
+        UIEdgeInsets inset = [self separatorInset];
+        if (!UIEdgeInsetsEqualToEdgeInsets(inset, UIEdgeInsetsZero)) {
+            if (!objc_getAssociatedObject(self, &LS720DeleteSeparatorInsetKey)) {
+                objc_setAssociatedObject(self, &LS720DeleteSeparatorInsetKey,
+                    [NSValue valueWithUIEdgeInsets:inset], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            [self setSeparatorInset:UIEdgeInsetsZero];
+        }
+    }
+}
+%end
 %end
 
 @interface SHTagResultDefaultParentViewController_iPhone : UIViewController
@@ -439,10 +624,14 @@ static char LS720ThumbnailKey;
 
 %end
 
+static char LSRelayResultPresenterKey;
+static char LSRelayResultSavedKey;
+
 @interface LSResultPresenter : NSObject {
     UIWindow *_previewWindow;
     UIWindow *_previousWindow;
 }
+- (void)addRelayResultToMyTags:(SHTagResultViewController_iPhone *)screen;
 + (void)showTitle:(NSString *)title artist:(NSString *)artist artwork:(NSData *)artwork artworkURL:(NSURL *)artworkURL;
 - (void)openTitle:(NSString *)title artist:(NSString *)artist artwork:(NSData *)artwork artworkURL:(NSURL *)artworkURL;
 @end
@@ -458,6 +647,77 @@ static char LS720ThumbnailKey;
     _previousWindow = nil;
 }
 
+static BOOL LSSaveRelayMatch720(NSManagedObject *preview, SHTaggingDataManager *manager, NSError **error) {
+    if (!preview || ![manager respondsToSelector:@selector(saveTagWithTrackId:eventId:tagId:)]) {
+        return NO;
+    }
+    SHCoreDataHelper *store = [manager coreDataHelper];
+    if (![store respondsToSelector:@selector(save:)]) {
+        return NO;
+    }
+
+    // A relay match has a local tag ID, but no native Shazam track or event ID.
+    NSManagedObject *saved = [manager saveTagWithTrackId:nil eventId:nil tagId:[[NSUUID UUID] UUIDString]];
+    NSManagedObjectContext *context = saved.managedObjectContext;
+    if (!context) {
+        return NO;
+    }
+    NSManagedObject *tag = [saved valueForKey:@"audioTag"];
+    LSCopyMatchFields(preview, saved);
+    [saved setValue:@YES forKey:@"wasAddedToMyTags"];
+    if ([store save:error]) {
+        if ([manager respondsToSelector:@selector(cacheTagCountData)]) {
+            [manager cacheTagCountData];
+        }
+        return YES;
+    }
+    if (tag.managedObjectContext == context) {
+        [context deleteObject:tag];
+    }
+    if (saved.managedObjectContext == context) {
+        [context deleteObject:saved];
+    }
+    return NO;
+}
+
+- (void)addRelayResultToMyTags:(SHTagResultViewController_iPhone *)screen {
+    if (!_previewWindow || screen.view.window != _previewWindow) {
+        return;
+    }
+
+    id delegate = [UIApplication sharedApplication].delegate;
+    SHDefaultUserInterfaceManager_iPhone *manager = [delegate respondsToSelector:@selector(userInterfaceManager)]
+        ? [delegate userInterfaceManager] : nil;
+    NSManagedObject *result = [screen tagResult];
+    if (!objc_getAssociatedObject(screen, &LSRelayResultSavedKey)) {
+        NSError *error = nil;
+        SHTaggingDataManager *tagManager = LSTagManager();
+        if (!tagManager && [manager respondsToSelector:@selector(taggingDataManager)]) {
+            tagManager = [manager taggingDataManager];
+        }
+        if (!LSSaveRelayMatch720(result, tagManager, &error)) {
+            NSLog(@"[ShazamX] Native My Tags save failed: %@", error);
+            screen.navigationItem.prompt = error.localizedDescription ?: @"Could not save to My Tags.";
+            return;
+        }
+        objc_setAssociatedObject(screen, &LSRelayResultSavedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [result setValue:@YES forKey:@"wasAddedToMyTags"];
+    }
+    id tabs = [manager respondsToSelector:@selector(tabBarController)] ? [manager tabBarController] : nil;
+    UIViewController *list = [manager respondsToSelector:@selector(tagListViewController)]
+        ? [manager tagListViewController] : nil;
+    if (!list || ![tabs respondsToSelector:@selector(setSelectedViewController:)]) {
+        screen.navigationItem.prompt = @"Saved to My Tags.";
+        return;
+    }
+
+    [self closePreview];
+    [tabs setSelectedViewController:list];
+    UINavigationController *navigation = [list isKindOfClass:[UINavigationController class]]
+        ? (UINavigationController *)list : list.navigationController;
+    [navigation popToRootViewControllerAnimated:NO];
+}
+
 + (void)showTitle:(NSString *)title artist:(NSString *)artist artwork:(NSData *)artwork artworkURL:(NSURL *)artworkURL {
     static LSResultPresenter *presenter;
     if (!presenter) {
@@ -471,19 +731,24 @@ static char LS720ThumbnailKey;
         return;
     }
     @try {
-        NSURL *modelURL = [[NSBundle mainBundle]
-            URLForResource:(LSShazam720 ? @"ShazamDataModel 7.2.0-0" : @"ShazamDataModel 5.5.1-0")
-            withExtension:@"mom"
-            subdirectory:@"ShazamDataModel.momd"];
-        if (!modelURL) {
-            [NSException raise:NSInternalInconsistencyException format:@"The Shazam data model was not found."];
-        }
-        NSManagedObjectModel *model = [[[NSManagedObjectModel alloc] initWithContentsOfURL:modelURL] autorelease];
-        NSEntityDescription *resultEntity = nil;
-        for (NSEntityDescription *entity in model.entities) {
-            if ([entity.managedObjectClassName isEqualToString:@"SHTagResultMO"]) {
-                resultEntity = entity;
-                break;
+        // The app version is fixed for this process. Keep the entity and its owning model alive.
+        static NSManagedObjectModel *resultModel;
+        static NSEntityDescription *resultEntity;
+        if (!resultModel) {
+            NSURL *modelURL = [[NSBundle mainBundle]
+                URLForResource:(LSShazam720 ? @"ShazamDataModel 7.2.0-0" : @"ShazamDataModel 5.5.1-0")
+                withExtension:@"mom"
+                subdirectory:@"ShazamDataModel.momd"];
+            if (!modelURL) {
+                [NSException raise:NSInternalInconsistencyException format:@"The Shazam data model was not found."];
+            }
+            NSManagedObjectModel *model = [[[NSManagedObjectModel alloc] initWithContentsOfURL:modelURL] autorelease];
+            for (NSEntityDescription *entity in model.entities) {
+                if ([entity.managedObjectClassName isEqualToString:@"SHTagResultMO"]) {
+                    resultModel = [model retain];
+                    resultEntity = entity;
+                    break;
+                }
             }
         }
 
@@ -526,6 +791,7 @@ static char LS720ThumbnailKey;
         [screen view];
         if (LSShazam720) {
             screen.navigationItem.prompt = artist;
+            objc_setAssociatedObject(screen, &LSRelayResultPresenterKey, self, OBJC_ASSOCIATION_ASSIGN);
         }
         screen.navigationItem.leftBarButtonItem = [[[UIBarButtonItem alloc]
             initWithBarButtonSystemItem:UIBarButtonSystemItemDone
@@ -547,6 +813,7 @@ static char LS720ThumbnailKey;
             }
             NSString *path = LS720CoverPath(title, artist, YES);
             if (path && [cover writeToFile:path atomically:YES]) {
+                [LS720CoverCache() removeObjectForKey:path];
                 NSString *indexBase = LS720CoverPath(title, @"title-index", NO);
                 NSString *indexPath = [indexBase stringByAppendingPathExtension:@"plist"];
                 NSDictionary *previous = [NSDictionary dictionaryWithContentsOfFile:indexPath];
@@ -635,6 +902,28 @@ static char LS720ThumbnailKey;
 }
 
 @end
+
+%group RelayAddToTags720
+%hook SHTagResultViewController_iPhone
+- (void)tableView:(UITableView *)table didSelectRowAtIndexPath:(NSIndexPath *)path {
+    LSResultPresenter *presenter = objc_getAssociatedObject(self, &LSRelayResultPresenterKey);
+    // Section 2 is the stock add-on list. Identify the action by its provider, independent of locale.
+    if (presenter && table == [self tableView] && path.section == 2) {
+        NSArray *actions = [self filteredAddOns];
+        if (path.row < actions.count) {
+            SHAddOn *action = [actions objectAtIndex:path.row];
+            if ([action respondsToSelector:@selector(providerName)] &&
+                [[action providerName] isEqualToString:@"tag_add"]) {
+                [table deselectRowAtIndexPath:path animated:YES];
+                [presenter addRelayResultToMyTags:self];
+                return;
+            }
+        }
+    }
+    %orig;
+}
+%end
+%end
 
 #import <AVFoundation/AVFoundation.h>
 
@@ -814,6 +1103,7 @@ static const float LSWedgeMeterGain = 1.25f;
     BOOL _busy;
     BOOL _waitingForRelay;
     NSUInteger _relayAttempt;
+    LSRelayWebRequest *_relayWebRequest;
     UILabel *_statusLabel;
     NSString *_previousStatus;
     BOOL _statusWasHidden;
@@ -914,6 +1204,21 @@ static NSData *LSShortRelayWAV(NSData *recording) {
 }
 
 @implementation LSRecognition
+
+- (void)sendRecognitionRequest:(NSURLRequest *)request completion:(LSRelayCompletion)completion {
+    if (!LSRelayUsesWebKit(request)) {
+        [NSURLConnection sendAsynchronousRequest:request queue:[NSOperationQueue mainQueue] completionHandler:completion];
+        return;
+    }
+    LSRelayWebRequest *transfer = [[[LSRelayWebRequest alloc] initWithRequest:request
+        completion:^(NSURLResponse *response, NSData *data, NSError *error) {
+            [_relayWebRequest release];
+            _relayWebRequest = nil;
+            completion(response, data, error);
+        }] autorelease];
+    _relayWebRequest = [transfer retain];
+    [transfer start];
+}
 
 - (void)showMessage:(NSString *)message {
     UIAlertView *alert = [[[UIAlertView alloc] initWithTitle:@"ShazamX"
@@ -1138,6 +1443,9 @@ static NSData *LSShortRelayWAV(NSData *recording) {
 
 - (void)finish {
     _waitingForRelay = NO;
+    [_relayWebRequest cancel];
+    [_relayWebRequest release];
+    _relayWebRequest = nil;
     [self stopAnimation];
     [self restoreStatusLabel];
     if (_ownsStatusLabel) {
@@ -1498,7 +1806,7 @@ static NSData *LSShortRelayWAV(NSData *recording) {
     NSURL *healthURL = [[NSURL URLWithString:@"/health" relativeToURL:relayURL] absoluteURL];
     NSURLRequest *request = [NSURLRequest requestWithURL:healthURL
         cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:MIN(12, remaining)];
-    LSSendRecognitionRequest(request, ^(NSURLResponse *response, NSData *data, NSError *error) {
+    [self sendRecognitionRequest:request completion:^(NSURLResponse *response, NSData *data, NSError *error) {
         if (!_waitingForRelay || attempt != _relayAttempt) {
             return;
         }
@@ -1523,7 +1831,7 @@ static NSData *LSShortRelayWAV(NSData *recording) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
             [self waitForRelayWithAudio:audio relayURL:relayURL deadline:deadline attempt:attempt];
         });
-    });
+    }];
 }
 
 
@@ -1551,7 +1859,7 @@ static BOOL LSConnectionWasReset(NSError *error) {
     if ([LS_RELAY_TOKEN length]) {
         [request setValue:LS_RELAY_TOKEN forHTTPHeaderField:@"X-Relay-Token"];
     }
-    LSSendRecognitionRequest(request, ^(NSURLResponse *response, NSData *data, NSError *error) {
+    [self sendRecognitionRequest:request completion:^(NSURLResponse *response, NSData *data, NSError *error) {
         if (!_waitingForRelay || attempt != _relayAttempt) {
             return;
         }
@@ -1610,7 +1918,7 @@ static BOOL LSConnectionWasReset(NSError *error) {
         }
         [LSResultPresenter showTitle:title artist:artist
                            artwork:LSDecodeArtwork([payload objectForKey:@"artwork"]) artworkURL:artworkURL];
-    });
+    }];
 }
 
 @end
@@ -1919,7 +2227,173 @@ static NSString *LSClearPendingQueue(SHBeaconManager *manager, NSUInteger *remov
 %end
 %end
 
+@interface LSClassicTagCoverLookup : NSObject {
+    UIImage *_cover;
+}
+- (id)initWithCover:(UIImage *)cover;
+- (id)objectForKey:(id)key;
+@end
+
+@implementation LSClassicTagCoverLookup
+- (id)initWithCover:(UIImage *)cover {
+    self = [super init];
+    if (self) {
+        _cover = [cover retain];
+    }
+    return self;
+}
+
+- (id)objectForKey:(id)key {
+    return _cover;
+}
+
+- (void)dealloc {
+    [_cover release];
+    [super dealloc];
+}
+@end
+
+@interface SHTagListViewController : UIViewController
+- (NSFetchedResultsController *)fetchedResultsControllerForTableView:(UITableView *)table;
+- (id)imageCache;
+@end
+
+@interface SHTagListTableViewCell : UITableViewCell
+- (UILabel *)dateLabel;
+@end
+
+static char LSClassicTagCoverLookupKey;
+static char LSClassicThumbnailModeKey;
+static const CGFloat LSClassicThumbnailSide = 64.0;
+
+static UIImage *LSClassicThumbnail(NSData *data) {
+    if (!data.length) {
+        return nil;
+    }
+
+    static NSCache *cache;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cache = [[NSCache alloc] init];
+        cache.countLimit = 16;
+        cache.totalCostLimit = 1024 * 1024;
+    });
+    UIImage *thumbnail = [cache objectForKey:data];
+    if (thumbnail) {
+        return thumbnail;
+    }
+
+    CGFloat scale = [UIScreen mainScreen].scale;
+    NSDictionary *sourceOptions = @{(NSString *)kCGImageSourceShouldCache: @NO};
+    CGImageSourceRef source = CGImageSourceCreateWithData((CFDataRef)data, (CFDictionaryRef)sourceOptions);
+    if (source) {
+        NSDictionary *options = @{
+            (NSString *)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+            (NSString *)kCGImageSourceCreateThumbnailWithTransform: @YES,
+            (NSString *)kCGImageSourceThumbnailMaxPixelSize: @(LSClassicThumbnailSide * scale)
+        };
+        CGImageRef image = CGImageSourceCreateThumbnailAtIndex(source, 0, (CFDictionaryRef)options);
+        if (image) {
+            thumbnail = [UIImage imageWithCGImage:image scale:scale orientation:UIImageOrientationUp];
+            NSUInteger cost = data.length + CGImageGetBytesPerRow(image) * CGImageGetHeight(image);
+            if (cost <= cache.totalCostLimit) {
+                [cache setObject:thumbnail forKey:data cost:cost];
+            }
+            CGImageRelease(image);
+        }
+        CFRelease(source);
+    }
+    return thumbnail ?: [UIImage imageWithData:data];
+}
+
+static void LSClassicSetThumbnailLayout(UITableViewCell *cell, BOOL enabled) {
+    NSNumber *originalMode = objc_getAssociatedObject(cell, &LSClassicThumbnailModeKey);
+    if (enabled && !originalMode) {
+        objc_setAssociatedObject(cell, &LSClassicThumbnailModeKey, @(cell.imageView.contentMode),
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        cell.imageView.contentMode = UIViewContentModeScaleAspectFit;
+        [cell setNeedsLayout];
+    } else if (!enabled && originalMode) {
+        cell.imageView.contentMode = (UIViewContentMode)originalMode.integerValue;
+        objc_setAssociatedObject(cell, &LSClassicThumbnailModeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [cell setNeedsLayout];
+    }
+}
+
 %group ClassicHistory
+%hook SHTagListTableViewCell
+- (void)layoutSubviews {
+    %orig;
+    if (!objc_getAssociatedObject(self, &LSClassicThumbnailModeKey)) {
+        return;
+    }
+    UIImageView *image = self.imageView;
+    UIView *container = image.superview;
+    if (!container) {
+        return;
+    }
+    CGFloat height = CGRectGetHeight(self.contentView.bounds);
+    CGFloat side = MAX(0, MIN(LSClassicThumbnailSide, height - 4.0));
+    CGRect slot = CGRectMake(0, floor((height - side) / 2.0), side, side);
+    image.frame = [container convertRect:slot fromView:self.contentView];
+    UILabel *labels[] = {self.textLabel, self.detailTextLabel, [self dateLabel]};
+    for (NSUInteger index = 0; index < sizeof(labels) / sizeof(labels[0]); index++) {
+        UILabel *label = labels[index];
+        if (!label.superview) {
+            continue;
+        }
+        CGRect frame = label.frame;
+        CGFloat left = [label.superview convertPoint:CGPointMake(side + 8.0, 0) fromView:self.contentView].x;
+        frame.size.width = MAX(0, CGRectGetMaxX(frame) - left);
+        frame.origin.x = left;
+        label.frame = frame;
+    }
+}
+%end
+
+%hook SHTagListViewController
+- (UITableViewCell *)tableView:(UITableView *)table cellForRowAtIndexPath:(NSIndexPath *)path {
+    NSManagedObject *result = [[self fetchedResultsControllerForTableView:table] objectAtIndexPath:path];
+    BOOL localTag = ![[result valueForKey:@"trackId"] longLongValue] &&
+        ![[result valueForKey:@"albumArtURLString"] length] &&
+        [[result valueForKey:@"completeResult"] boolValue] &&
+        [[[result valueForKey:@"audioTag"] valueForKey:@"submitted"] boolValue];
+    if (!localTag) {
+        UITableViewCell *cell = %orig;
+        LSClassicSetThumbnailLayout(cell, NO);
+        return cell;
+    }
+
+    UIImage *cover = LSClassicThumbnail([result valueForKey:@"albumArtThumbnailData"]);
+    if (!cover) {
+        cover = LSClassicThumbnail([result valueForKey:@"albumArtData"]);
+    }
+    cover = cover ?: [UIImage imageNamed:@"cover_noproduct"];
+    if (!cover) {
+        UITableViewCell *cell = %orig;
+        LSClassicSetThumbnailLayout(cell, NO);
+        return cell;
+    }
+
+    // The stock row would look up all local tags under the same missing track ID.
+    // Give it this row's image synchronously so it also skips the async thumbnail load.
+    id previousLookup = [objc_getAssociatedObject(self, &LSClassicTagCoverLookupKey) retain];
+    LSClassicTagCoverLookup *lookup = [[[LSClassicTagCoverLookup alloc] initWithCover:cover] autorelease];
+    objc_setAssociatedObject(self, &LSClassicTagCoverLookupKey, lookup, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    @try {
+        UITableViewCell *cell = %orig;
+        LSClassicSetThumbnailLayout(cell, YES);
+        return cell;
+    } @finally {
+        objc_setAssociatedObject(self, &LSClassicTagCoverLookupKey, previousLookup, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [previousLookup release];
+    }
+}
+
+- (id)imageCache {
+    return objc_getAssociatedObject(self, &LSClassicTagCoverLookupKey) ?: %orig;
+}
+%end
 @interface LSManageTagsController : UITableViewController <UIAlertViewDelegate> {
     NSArray *_tags;
 }
@@ -2182,6 +2656,7 @@ forRowAtIndexPath:(NSIndexPath *)path {
     if (LSShazam720) {
         %init(NativeSpectrum720);
         %init(TagArtwork720);
+        %init(RelayAddToTags720);
     }
 }
 

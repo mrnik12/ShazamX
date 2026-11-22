@@ -1,12 +1,12 @@
 Package: org.legacyshazam.smoke
 Name: ShazamX
-Version: 0.3.8
+Version: 0.4.0
 Architecture: iphoneos-arm
 Description: Song recognition for Shazam 5.5.1 on iOS 6 and Shazam 7.2.0 on iOS 7.
  .
  Netrun is the default recognition server. Render remains available in Settings.
  .
- Known limitation: opening a saved tag can remain on the loading screen on Shazam 7.2.0.
+ On Shazam 7.2.0, Add to Tags opens My Tags, and saved tags show cached cover art when available.
  .
  Enable or disable ShazamX in Settings > ShazamX.
 Maintainer: mrnik12
