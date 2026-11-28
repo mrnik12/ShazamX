@@ -5,7 +5,7 @@ ShazamX restores song recognition in legacy versions of Shazam. Version 0.4.0 su
 ## Install
 
 1. Install Shazam 5.5.1 on iOS 6 or Shazam 7.2.0 on iOS 7.
-2. Install ShazamX from the [Cydia repo](https://mrnik12.github.io/repo/) or download the [0.4.0 DEB](https://mrnik12.github.io/repo/debs/org.legacyshazam.smoke_0.4.0_iphoneos-arm.deb).
+2. Install ShazamX from the [Cydia repo](https://mrnik12.github.io/repo/) or download the [0.4.1 DEB](https://mrnik12.github.io/repo/debs/org.legacyshazam.smoke_0.4.1_iphoneos-arm.deb).
 3. Open Shazam and tap the dial. To change the recognition server or turn ShazamX off, use **Settings → ShazamX**.
 
 Netrun is the default recognition server. Upgrades from the public Render-only release switch automatically. Render is still available in Settings.
